@@ -2,7 +2,9 @@
 
 **Status: verified 2026-10-05. Depends on three betas (SteamVR 2.18.x beta + Steam Link beta + Steam client beta) — re-verify after every Valve update.**
 
-Official Steam documentation for USB-tethered Quest streaming covers Windows and macOS only. This repo documents what it actually takes to run **Steam Link over USB (NCM) on a Linux host with a Quest 2**, including the three non-obvious root causes that bite you on Linux — none of which are in any Valve or Meta documentation.
+Official Steam documentation for USB-tethered Quest streaming covers Windows and macOS only. This repo documents what it actually takes to run **Steam Link over USB (NCM) on a Linux host with a Quest 2**, including the six non-obvious root causes that bite you on Linux (and the client-version / launch-method decisions that hide behind them) — none of which are in any Valve or Meta documentation.
+
+**Start with [Using the right client version, the right way](#using-the-right-client-version-the-right-way-the-must-read)** — most of the pain in this space is not the USB part, it is the wrong client version or the wrong launch method.
 
 It is **not** a tutorial for "how to connect a Quest over USB" — that part is official and works out of the box. It is the recovery guide for the specific failures that happen once you are on Linux, plus the network plumbing that lets the USB link and your PC's internet coexist.
 
@@ -16,6 +18,37 @@ It is **not** a tutorial for "how to connect a Quest over USB" — that part is 
 | PC loses internet the moment you plug in the Quest | NetworkManager activates a profile on the new `enx*` interface and takes the default route | the auto-generated NM profile for the NCM interface has no never-default setting | `unmanaged-devices=interface-name:enx*` + udev + `ncm-up` service (included) |
 | (Docker users) NCM data link never registers, video dead but audio works | `SVLDataLinkUber … list is full` in the vrserver log | vrlink enumerates every local interface into a capped table with no dedup; Docker's v6 bridge/veth entries fill it before NCM gets listed | `91-docker-no-v6.rules` (included) — veth/br-* interfaces go v4-only |
 | (64-bit client users) SteamVR fails to start, -201 after ~20 s | `vrcompositor` never appears; compositor launcher log loops `Relaunch under scout LDLP runtime` → `Argument list too long` | three independent breaks: (1) the 64-bit launcher service only registers the D-Bus name with an `.Instance<N>` suffix (steamVR-for-Linux #936), the compositor wants the plain name; (2) `vrcompositor-launcher.sh` needs the scout runtime, `LegacySteamRuntime` is missing and the fallback is a no-op stub → re-exec loop; (3) the compositor then starts **slowly** (a few minutes) and looks dead | `ripps818/steamvr-busname-fix` (user service, re-registers the plain name) + `VALVE_SKIP_RUNTIME_SAFETY=1` (in the wrapper) + be patient |
+
+## Using the right client version, the right way (the must-read)
+
+Before any cable work, make two decisions — every failure mode above is one of these two going wrong:
+
+### Decision 1: which Steam client version
+
+| | 64-bit client (`steamrt64` / SteamRT3) | 32-bit client (`ubuntu12_32`, default) |
+|---|---|---|
+| Opt-in | client beta + `STEAM_FORCE_CLIENT=steamrt64` (marker set automatically; `STEAM_FORCE_CLIENT=ubuntu12_32` switches back) | default |
+| Encoding on RDNA4 (e.g. R9700) | **hardware** — mesa 26.x has VCN 5.0 → good FPS | **encoding wall** — mesa 23.0 predates VCN 5.0 → `libx264` software fallback → low FPS |
+| SteamVR | three independent breaks, all worked around (see [the 64-bit section](#64-bit-client-steamrt3-getting-steamvr-to-work)) | works out of the box |
+| Non-VR game-mode capture | drops after ~1–12 s (portal session lifecycle, unresolved) | drops after ~1–10 s too; **also** needs `libpipewire-0.3-modules:i386` or capture goes black |
+| **Verdict** | **use this if you want good FPS on RDNA4** | fallback if the 64-bit path won't come up |
+
+### Decision 2: how to launch it
+
+**The one right way: launch through `wrappers/steam-igpu.sh`** (or a menu entry that points at it). Every version/platform fix is **exported inside that script**, and every other launch method has a documented, different failure:
+
+| Launch method | What happens |
+|---|---|
+| ✅ `./wrappers/steam-igpu.sh` | the only verified working path — `DRI_PRIME=0` + `STEAM_FORCE_CLIENT=steamrt64` + `VALVE_SKIP_RUNTIME_SAFETY=1` + `-cef-disable-gpu` + `-pipewire` all baked in |
+| ❌ plain "Steam" entry | a valid `DRI_PRIME` in the environment → garbled video (RADV Vulkan encode corruption); CEF UI crash loop on headless-dGPU setups |
+| ❌ a wrapper that sets `STEAM_RUNTIME=0` | `steam-runtime-launcher-service` never starts → compositor dies with zero log, -201/450 after ~20 s |
+| ❌ a `.desktop` entry with the variables in `Environment=` lines | **GNOME does not apply `Environment=` lines** (verified via `/proc/<pid>/environ`), and gnome-shell serves stale cached entries — the variables silently never reach the client |
+| ❌ 64-bit client without `VALVE_SKIP_RUNTIME_SAFETY=1` | compositor launcher re-execs until `Argument list too long` → -201 |
+| ❌ 64-bit client without the ripps818 D-Bus fix | compositor launch can't find the plain D-Bus name (#936) → -201 |
+
+Once both decisions are made, the [one-time setup](#one-time-setup) below is the whole rest of it: `ncm-install.sh` + `setcap` + (64-bit) ripps818, then the [per-session flow](#per-session-flow).
+
+**The one patience rule:** on the 64-bit client the compositor takes **a few minutes** to come up. It is not dead. Do not kill it early.
 
 ## What is verified, precisely
 
