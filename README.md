@@ -15,6 +15,7 @@ It is **not** a tutorial for "how to connect a Quest over USB" — that part is 
 | App stays on "connecting…" forever | discovery works (app finds the PC) but no video; PC side shows a real IPv4 on the NCM interface | when the PC's NCM interface holds a real IPv4 address, the Steam client only announces over IPv4; the transport path is **pure IPv6 link-local**, so no v6 path is ever built | keep the PC NCM interface v6-only (no IPv4); the Steam Link app itself configures the headset side (`10.86.13.37/29` static, no gateway) |
 | PC loses internet the moment you plug in the Quest | NetworkManager activates a profile on the new `enx*` interface and takes the default route | the auto-generated NM profile for the NCM interface has no never-default setting | `unmanaged-devices=interface-name:enx*` + udev + `ncm-up` service (included) |
 | (Docker users) NCM data link never registers, video dead but audio works | `SVLDataLinkUber … list is full` in the vrserver log | vrlink enumerates every local interface into a capped table with no dedup; Docker's v6 bridge/veth entries fill it before NCM gets listed | `91-docker-no-v6.rules` (included) — veth/br-* interfaces go v4-only |
+| (64-bit client users) SteamVR fails to start, -201 after ~20 s | `vrcompositor` never appears; compositor launcher log loops `Relaunch under scout LDLP runtime` → `Argument list too long` | three independent breaks: (1) the 64-bit launcher service only registers the D-Bus name with an `.Instance<N>` suffix (steamVR-for-Linux #936), the compositor wants the plain name; (2) `vrcompositor-launcher.sh` needs the scout runtime, `LegacySteamRuntime` is missing and the fallback is a no-op stub → re-exec loop; (3) the compositor then starts **slowly** (a few minutes) and looks dead | `ripps818/steamvr-busname-fix` (user service, re-registers the plain name) + `VALVE_SKIP_RUNTIME_SAFETY=1` (in the wrapper) + be patient |
 
 ## What is verified, precisely
 
@@ -55,7 +56,15 @@ sudo setcap CAP_SYS_NICE=eip ~/.local/share/Steam/steamapps/common/SteamVR/bin/l
 Start Steam with the included wrapper (not the normal "Steam" entry if your environment carries a valid `DRI_PRIME`):
 
 ```bash
-./wrappers/steam-igpu.sh   # DRI_PRIME=0 + -cef-disable-gpu + -pipewire, runtime enabled
+./wrappers/steam-igpu.sh   # DRI_PRIME=0 + STEAM_FORCE_CLIENT=steamrt64 + VALVE_SKIP_RUNTIME_SAFETY=1 + -cef-disable-gpu + -pipewire, runtime enabled
+```
+
+(64-bit client users, see the section below): also install the D-Bus name fix once:
+
+```bash
+# ripps818/steamvr-busname-fix — stopgap for steamVR-for-Linux #936
+git clone https://github.com/ripps818/steamvr-busname-fix
+# follow its README: installs a systemd user service (auto-starts with your session)
 ```
 
 ## Per-session flow
@@ -86,6 +95,20 @@ Symptom: VR works, non-VR game mode is capped low, monitor shows full FPS, heads
 
 - **Multi-GPU crash risk** (steamVR-for-Linux #915, open): on iGPU-primary + headless dGPU systems, `-pipewire` can crash SteamVR + client when switching to the desktop tab inside VR. **Re-test the VR path after adding the flag.**
 - The 32-bit client needs 32-bit `libEGL`/`libva`/`radeonsi` — check `streaming_log.txt` (or F6 overlay): you want "PipeWire NV12 DMABUF + VAAPI HEVC"; plain `libx264` means the hardware encode fell back to the slow CPU path.
+- On the 32-bit client the non-VR PipeWire capture **still drops after ~1–10 s** (log: `PipeWire stream state changed to unconnected → Stopping capture session`). Unresolved; leading hypothesis is the xdg-desktop-portal session lifecycle (portal 1.21.x closes the screencast session when the requesting app's D-Bus connection dies). Independent of client bitness. The **VR path is unaffected** (the SteamVR compositor produces frames itself — 2D gaming in the VR desktop view works stably).
+- On the 32-bit client, `libpipewire-0.3-modules:i386` must be installed or the PipeWire capture goes **black** (32-bit client, 64-bit-only modules).
+
+## 64-bit client (SteamRT3): getting SteamVR to work
+
+The 64-bit client (`steamrt64`, opt-in: Steam client beta + `STEAM_FORCE_CLIENT=steamrt64`) exists here to fix the **32-bit encoding wall** (mesa 23.0 predates RDNA4 VCN 5.0 → x264 fallback → low FPS). It is experimental, and its SteamVR path has **three independent breaks** — all verified, all worked around:
+
+1. **D-Bus name (steamVR-for-Linux #936).** The 64-bit `srt-launcher-service` registers only `com.steampowered.PressureVessel.LaunchAlongsideSteam.Instance<N>` (the suffixed name). The compositor launch (`steam-runtime-launch-client --alongside-steam` with no `--bus-name`) looks for the **plain** name, finds nothing, and the compositor never launches. **Fix: [`ripps818/steamvr-busname-fix`](https://github.com/ripps818/steamvr-busname-fix)** — a small systemd *user* service that re-registers the plain name every 5 s and after every Steam restart. It is a **stopgap**: uninstall it (`systemctl --user disable --now steamvr-busname-fix`) once Valve fixes #936. Ruled out with evidence: lost setcap, a SteamVR update, or a 32/64-bit binary difference (both clients run the same Oct 2 2026 build).
+2. **Compositor launcher re-exec loop.** `vrcompositor-launcher.sh` requires the "scout LDLP" runtime. On the 64-bit client, `LegacySteamRuntime` is missing and the fallback (`~/.steam/root/ubuntu12_32/steam-runtime/run.sh`) is a symlink to a no-op stub that just re-runs the script on the host. Result: infinite re-exec, arguments accumulate, `exec: …: Argument list too long`, compositor never launches, watchdog aborts at ~20 s. **Fix: `VALVE_SKIP_RUNTIME_SAFETY=1`** (a built-in escape hatch in the script) — the compositor then runs in the 64-bit environment. (The `vrsetup.sh` setcap step hits the same missing path but fails harmlessly.)
+3. **The compositor starts slowly.** With the above two fixed, `vrcompositor` takes **a few minutes** to come up (observed: server up 23:00, compositor up ~23:04). It is not dead — do not kill it early.
+
+**Verified (2026-10-05):** with all three in place — `vrserver` + `vrmonitor` + `vrcompositor` alive, zero crash dumps (only harmless discarded asserts), compositor log actively writing; **2D gaming in the VR desktop view works with good FPS** (hw encode working; the encoding wall is fixed). The non-VR PipeWire capture drop (above) persists on 64-bit as well.
+
+**GNOME launch gotcha (verified, cost us a session):** GNOME **does not apply `.desktop` `Environment=` lines** (the client's `/proc/<pid>/environ` contains the wrapper's own `export`s but not the `.desktop` ones), and gnome-shell serves **stale cached entries** right after a `.desktop` edit. Therefore the client selection and `VALVE_SKIP_RUNTIME_SAFETY` are **exported inside `wrappers/steam-igpu.sh` itself** — every launch path (menu entry, wrapper, direct) goes through it.
 
 ## Verified numbers
 
@@ -100,7 +123,8 @@ See [docs/troubleshooting.md](docs/troubleshooting.md) — symptom → root caus
 
 ## Maintenance notes
 
-- `setcap` on `vrcompositor-launcher` must be redone after every SteamVR update.
+- `setcap` on `vrcompositor-launcher` must be redone after every SteamVR update (the update replaces the file).
+- `ripps818/steamvr-busname-fix` is a stopgap for #936 — **uninstall it once Valve fixes the bug** (`systemctl --user disable --now steamvr-busname-fix`). It re-registers the plain D-Bus name every 5 s and after every Steam restart; it is idle (harmless) on a 32-bit client.
 - Docker networks with IPv6 will recreate the data-link table problem — the udev rule handles new veth/br on plug, but existing ones need one cleanup pass (included in `ncm-install.sh`).
 - The beta trio changes. Re-verify the whole chain after SteamVR stable catches up; this repo's fixes may become unnecessary.
 
@@ -109,6 +133,7 @@ See [docs/troubleshooting.md](docs/troubleshooting.md) — symptom → root caus
 - `UbootVRC/Wired-Steam-Link-VR` (MIT) — the NCM mechanism teardown and Windows reference; tested on Quest 2 (Android 14).
 - `TheDoctorTTV/Wired-Steam-Link-VR-Linux` — the Linux port of the above.
 - `kkoemets/quest-vd-wired` — archived once official support landed.
+- `ripps818/steamvr-busname-fix` — the D-Bus name workaround for #936 (64-bit client).
 - Upstream issues: steamVR-for-Linux #936 (launcher service / -201), #904 & #965 (AMD encode corruption), #915 (multi-GPU + `-pipewire`).
 - UploadVR / vr.org / Road to VR / XR Guidebook — beta mechanics and cable testing.
 
