@@ -1,0 +1,5 @@
+# Bring the Quest NCM (cdc_ncm) interface up the moment it appears.
+# The NCM MAC changes on every Quest boot, so the interface name changes too
+# (enx<mac>) — match on driver, not name. ncm-up.service covers the "stays
+# down" case with a 3s loop; this rule just makes the first appearance fast.
+ACTION=="add", SUBSYSTEM=="net", ENV{DRIVER}=="cdc_ncm", RUN+="/usr/bin/ip link set %k up"

@@ -1,0 +1,16 @@
+# Prevent Docker's IPv6 bridge/veth interfaces from filling SteamVR's
+# SVLDataLinkUber table (hard cap ~16-19 entries, no dedup).
+#
+# vrlink enumerates every local interface into that table at startup. On a
+# machine with many Docker networks (v4+v6 each take a slot), the table is
+# full before the NCM interface — which is listed last — ever gets in.
+# Result: "list is full" in the vrserver log, video data link never
+# registers, no video (audio still works).
+#
+# Making veth/br-* v4-only frees the slots. Home v6 is untouched, Docker
+# services are untouched (they run over the v4 side).
+#
+# Note: existing veth/br interfaces need a one-time cleanup pass
+# (scripts/ncm-install.sh does it); this rule covers new ones on plug.
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="veth*", RUN+="/usr/bin/sysctl -w net.ipv6.conf.%k.disable_ipv6=1"
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="br-*", RUN+="/usr/bin/sysctl -w net.ipv6.conf.%k.disable_ipv6=1"

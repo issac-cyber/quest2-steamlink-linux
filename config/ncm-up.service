@@ -1,0 +1,20 @@
+# Keep the Quest NCM (cdc_ncm) interface up.
+#
+# The Steam Link app re-toggles USB to NCM on reconnect, and the NCM MAC
+# changes on every Quest boot (new interface name each time). This service
+# checks every 3 s for any cdc_ncm interface and brings it up if DOWN.
+# Enabled at boot; no manual step needed after plug.
+#
+# Matches on the device driver (readlink device/driver), because the
+# interface name (enx<mac>) changes with the headset's MAC.
+[Unit]
+Description=Keep Quest NCM (cdc_ncm) network interface up
+After=network.target
+
+[Service]
+ExecStart=/bin/sh -c 'while true; do for dev in /sys/class/net/*; do drv=$(readlink "$dev/device/driver" 2>/dev/null || true); case "$drv" in *cdc_ncm*) name=$(basename "$dev"); if ! /usr/bin/ip -o link show "$name" 2>/dev/null | grep -q "state UP"; then /usr/bin/ip link set "$name" up 2>/dev/null; fi;; esac; done; sleep 3; done'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
